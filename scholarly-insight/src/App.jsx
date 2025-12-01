@@ -17,13 +17,25 @@ export default function ScholarlyInsight() {
   const [authMode, setAuthMode] = useState('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [username, setUsername] = useState('');
+  const [usernameError, setUsernameError] = useState('');
+  const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
     checkUser();
     
     // Listen for auth changes
     const { data: authListener } = supabase.auth.onAuthStateChange((event, session) => {
-      setUser(session?.user ?? null);
+      console.log('Auth state changed:', event, session?.user?.email_confirmed_at);
+      // Only set user if email is confirmed
+      if (session?.user?.email_confirmed_at) {
+        setUser(session.user);
+        console.log('User logged in with confirmed email');
+      } else {
+        setUser(null);
+        console.log('User not logged in or email not confirmed');
+      }
+      setAuthLoading(false);
     });
 
     return () => {
@@ -46,8 +58,59 @@ export default function ScholarlyInsight() {
   }, [selectedArticle]);
 
   const checkUser = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    setUser(user);
+    try {
+      const { data: { user }, error } = await supabase.auth.getUser();
+      console.log('Check user result:', user?.email_confirmed_at, error);
+      // Only set user if they've confirmed their email
+      if (user && user.email_confirmed_at) {
+        setUser(user);
+        console.log('User verified on initial load');
+      } else if (user) {
+        console.log('User exists but email not confirmed:', user.email);
+        setUser(null);
+      } else {
+        setUser(null);
+      }
+    } catch (err) {
+      console.error('Error checking user:', err);
+      setUser(null);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const checkUsernameAvailable = async (username) => {
+    const { data, error } = await supabase
+      .from('users')
+      .select('username', { count: 'exact' })
+      .eq('username', username);
+    
+    // If no error and data array is empty, username is available
+    if (error) {
+      console.error('Error checking username:', error);
+      return false;
+    }
+    
+    return data.length === 0;
+  };
+
+  const formatTimeEastern = (dateString) => {
+    // Parse the ISO string properly as UTC
+    const date = new Date(dateString + (dateString.includes('Z') ? '' : 'Z'));
+    
+    // Get the time in Eastern timezone
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
+    
+    return formatter.format(date) + ' ET';
   };
 
   const handleAuth = async () => {
@@ -55,19 +118,82 @@ export default function ScholarlyInsight() {
       alert('Please enter email and password');
       return;
     }
+    if (authMode === 'signup' && !username) {
+      alert('Please enter a username');
+      return;
+    }
 
-    const { data, error } = authMode === 'login'
-      ? await supabase.auth.signInWithPassword({ email, password })
-      : await supabase.auth.signUp({ email, password });
+    if (authMode === 'signup') {
+      // Check if username is available
+      const isAvailable = await checkUsernameAvailable(username);
+      if (!isAvailable) {
+        setUsernameError('Username already taken. Please choose another.');
+        return;
+      }
+      setUsernameError('');
+    }
+
+    let authData;
+    if (authMode === 'login') {
+      // Try with email first
+      let result = await supabase.auth.signInWithPassword({ email, password });
+      
+      // If email login fails, try with username
+      if (result.error) {
+        console.log('Email login failed, trying with username...');
+        
+        // Query the users table to find the email associated with this username
+        const { data: userData, error: queryError } = await supabase
+          .from('users')
+          .select('email')
+          .eq('username', email);
+        
+        console.log('Username query result:', userData, queryError);
+        
+        // Get the first matching user if found
+        if (userData && userData.length > 0 && userData[0]?.email) {
+          console.log('Found user with email:', userData[0].email);
+          result = await supabase.auth.signInWithPassword({ email: userData[0].email, password });
+        } else {
+          console.log('No user found with username:', email);
+        }
+      }
+      
+      authData = result;
+    } else {
+      // Signup - set username in metadata BEFORE signup so the trigger can access it
+      authData = await supabase.auth.signUp({ 
+        email, 
+        password,
+        options: {
+          data: {
+            username: username
+          }
+        }
+      });
+    }
+    
+    const { data, error } = authData;
     
     if (error) {
-      alert(error.message);
+      if (error.message.includes('Invalid login credentials')) {
+        alert('Invalid email/username or password');
+      } else if (error.message.includes('Email not confirmed')) {
+        alert('Please confirm your email before logging in. Check your inbox for a confirmation link.');
+      } else {
+        alert(`Error: ${error.message}`);
+      }
+      console.error('Auth error:', error);
     } else {
-      if (authMode === 'signup') {
-        alert('Account created! Please check your email to verify your account.');
+      if (authMode === 'signup' && data?.user) {
+        console.log('User successfully signed up:', data.user.id);
+        console.log('User record will be created automatically by database trigger');
+        alert('Account created! Please check your email to verify your account. After confirmation, you can log in.');
       }
       setEmail('');
       setPassword('');
+      setUsername('');
+      setAuthMode('login');
     }
   };
 
@@ -137,6 +263,12 @@ export default function ScholarlyInsight() {
       const parsedArticles = Array.from(entries).map((entry, index) => {
         console.log(`Parsing entry ${index + 1}`);
         
+        // Extract all categories from arxiv:primary_category and category elements
+        const categoryElements = entry.querySelectorAll('arxiv\\:primary_category, category');
+        const categories = Array.from(categoryElements)
+          .map(el => el.getAttribute('term'))
+          .filter(Boolean);
+        
         const article = {
           id: entry.querySelector('id')?.textContent || '',
           title: entry.querySelector('title')?.textContent?.trim().replace(/\s+/g, ' ') || '',
@@ -144,10 +276,11 @@ export default function ScholarlyInsight() {
           authors: Array.from(entry.querySelectorAll('author name')).map(a => a.textContent),
           published: entry.querySelector('published')?.textContent || '',
           link: entry.querySelector('id')?.textContent || '',
-          pdfLink: entry.querySelector('link[title="pdf"]')?.getAttribute('href') || ''
+          pdfLink: entry.querySelector('link[title="pdf"]')?.getAttribute('href') || '',
+          categories: categories.length > 0 ? categories : ['Uncategorized']
         };
         
-        console.log('Parsed article:', article.title);
+        console.log('Parsed article:', article.title, 'Categories:', categories);
         return article;
       });
       
@@ -195,7 +328,10 @@ export default function ScholarlyInsight() {
       .eq('article_id', articleId)
       .order('created_at', { ascending: false });
     
-    if (!error) {
+    if (error) {
+      console.error('Error loading comments:', error);
+    } else {
+      console.log('Comments loaded:', data);
       setComments(data || []);
     }
   };
@@ -222,11 +358,20 @@ export default function ScholarlyInsight() {
   const addToHistory = async (article) => {
     if (!user) return;
     
-    await supabase.from('history').insert({
-      user_id: user.id,
-      article_id: article.id,
-      article_data: article
-    });
+    // Check if article already exists in history
+    const existing = historyList.find(h => h.article_id === article.id);
+    
+    if (existing) {
+      // Update the viewed_at timestamp for existing entry
+      await supabase.from('history').update({ viewed_at: new Date().toISOString() }).eq('id', existing.id);
+    } else {
+      // Create new history entry
+      await supabase.from('history').insert({
+        user_id: user.id,
+        article_id: article.id,
+        article_data: article
+      });
+    }
     
     loadHistory();
   };
@@ -234,20 +379,50 @@ export default function ScholarlyInsight() {
   const addComment = async () => {
     if (!user || !newComment.trim() || !selectedArticle) return;
     
+    // Get username from users table
+    const { data: userData } = await supabase
+      .from('users')
+      .select('username')
+      .eq('user_id', user.id)
+      .single();
+    
+    const commentUsername = userData?.username || user.user_metadata?.username;
+    
+    console.log('Adding comment with username:', commentUsername);
+    
     const { error } = await supabase.from('comments').insert({
       user_id: user.id,
       article_id: selectedArticle.id,
       user_email: user.email,
+      username: commentUsername,
       content: newComment
     });
     
-    if (!error) {
+    if (error) {
+      console.error('Error adding comment:', error);
+      alert(`Error posting comment: ${error.message}`);
+    } else {
       setNewComment('');
       loadComments(selectedArticle.id);
     }
   };
 
+  const deleteComment = async (commentId) => {
+    const { error } = await supabase.from('comments').delete().eq('id', commentId);
+    if (error) {
+      console.error('Delete error:', error);
+      alert(`Error deleting comment: ${error.message}`);
+    } else {
+      loadComments(selectedArticle.id);
+    }
+  };
+
   const isFavorited = (articleId) => favorites.some(f => f.article_id === articleId);
+
+  const removeFavorite = async (favoriteId) => {
+    await supabase.from('favorites').delete().eq('id', favoriteId);
+    loadFavorites();
+  };
 
   if (!user) {
     return (
@@ -258,6 +433,12 @@ export default function ScholarlyInsight() {
             <h1 className="text-3xl font-bold text-gray-800">Scholarly Insight</h1>
           </div>
           
+          {authLoading ? (
+            <div className="text-center py-8">
+              <p className="text-gray-600">Loading...</p>
+            </div>
+          ) : (
+            <>
           <div className="flex mb-6 border-b">
             <button
               onClick={() => setAuthMode('login')}
@@ -274,6 +455,23 @@ export default function ScholarlyInsight() {
           </div>
           
           <div className="space-y-4">
+            {authMode === 'signup' && (
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Username</label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => {
+                    setUsername(e.target.value);
+                    setUsernameError('');
+                  }}
+                  onKeyPress={(e) => e.key === 'Enter' && handleAuth()}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                  placeholder="Choose a public username"
+                />
+                {usernameError && <p className="text-red-600 text-sm mt-1">{usernameError}</p>}
+              </div>
+            )}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
               <input
@@ -302,6 +500,8 @@ export default function ScholarlyInsight() {
               {authMode === 'login' ? 'Login' : 'Sign Up'}
             </button>
           </div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -341,7 +541,7 @@ export default function ScholarlyInsight() {
             </button>
             <div className="flex items-center text-sm text-gray-600 ml-4">
               <User className="w-4 h-4 mr-1" />
-              {user.email}
+              {user.user_metadata?.username || user.email}
             </div>
             <button
               onClick={handleLogout}
@@ -398,6 +598,13 @@ export default function ScholarlyInsight() {
                   <div className="flex justify-between items-start">
                     <div className="flex-1">
                       <h3 className="text-xl font-semibold text-gray-800 mb-2">{article.title}</h3>
+                      <div className="mb-2 flex flex-wrap gap-1">
+                        {article.categories?.map((category, idx) => (
+                          <span key={idx} className="inline-block bg-indigo-100 text-indigo-700 text-xs font-semibold px-2 py-1 rounded">
+                            {category}
+                          </span>
+                        ))}
+                      </div>
                       <p className="text-sm text-gray-600 mb-2">
                         {article.authors.slice(0, 3).join(', ')}
                         {article.authors.length > 3 && ' et al.'}
@@ -459,7 +666,16 @@ export default function ScholarlyInsight() {
                 const article = fav.article_data;
                 return (
                   <div key={fav.id} className="bg-white rounded-lg shadow-md p-6">
-                    <h3 className="text-xl font-semibold text-gray-800 mb-2">{article.title}</h3>
+                    <div className="flex justify-between items-start mb-2">
+                      <h3 className="text-xl font-semibold text-gray-800 flex-1">{article.title}</h3>
+                      <button
+                        onClick={() => removeFavorite(fav.id)}
+                        className="ml-4 p-2 text-red-600 hover:bg-red-50 rounded-lg"
+                        title="Remove from favorites"
+                      >
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
                     <p className="text-sm text-gray-600 mb-2">{article.authors.slice(0, 3).join(', ')}</p>
                     <p className="text-gray-700 mb-3 line-clamp-2">{article.summary}</p>
                     <div className="flex gap-2">
@@ -497,7 +713,7 @@ export default function ScholarlyInsight() {
                       <div>
                         <h3 className="text-xl font-semibold text-gray-800 mb-2">{article.title}</h3>
                         <p className="text-sm text-gray-600 mb-2">{article.authors.slice(0, 3).join(', ')}</p>
-                        <p className="text-xs text-gray-500">Viewed: {new Date(hist.viewed_at).toLocaleString()}</p>
+                        <p className="text-xs text-gray-500">Viewed: {formatTimeEastern(hist.viewed_at)}</p>
                       </div>
                     </div>
                   </div>
@@ -523,7 +739,14 @@ export default function ScholarlyInsight() {
               <p className="text-sm text-gray-600 mb-4">
                 <strong>Authors:</strong> {selectedArticle.authors.join(', ')}
               </p>
-              <p className="text-gray-700 mb-6">{selectedArticle.summary}</p>
+              <p className="text-gray-700 mb-4">{selectedArticle.summary}</p>
+              <div className="mb-6 flex flex-wrap gap-1">
+                {selectedArticle.categories?.map((category, idx) => (
+                  <span key={idx} className="inline-block bg-indigo-100 text-indigo-700 text-sm font-semibold px-3 py-1 rounded">
+                    {category}
+                  </span>
+                ))}
+              </div>
               
               <div className="border-t border-gray-200 pt-6">
                 <h3 className="text-xl font-semibold text-gray-800 mb-4 flex items-center">
@@ -550,12 +773,23 @@ export default function ScholarlyInsight() {
                 <div className="space-y-4">
                   {comments.map((comment) => (
                     <div key={comment.id} className="bg-gray-50 rounded-lg p-4">
-                      <div className="flex items-center mb-2">
-                        <User className="w-4 h-4 text-gray-600 mr-2" />
-                        <span className="text-sm font-semibold text-gray-700">{comment.user_email}</span>
-                        <span className="text-xs text-gray-500 ml-2">
-                          {new Date(comment.created_at).toLocaleString()}
-                        </span>
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center">
+                          <User className="w-4 h-4 text-gray-600 mr-2" />
+                          <span className="text-sm font-semibold text-gray-700">{comment.username}</span>
+                          <span className="text-xs text-gray-500 ml-2">
+                            {formatTimeEastern(comment.created_at)}
+                          </span>
+                        </div>
+                        {user?.id === comment.user_id && (
+                          <button
+                            onClick={() => deleteComment(comment.id)}
+                            className="ml-2 p-1 text-red-600 hover:bg-red-50 rounded"
+                            title="Delete comment"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                       <p className="text-gray-700">{comment.content}</p>
                     </div>
